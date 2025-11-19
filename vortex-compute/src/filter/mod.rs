@@ -6,7 +6,7 @@
 mod bitbuffer;
 mod buffer;
 mod mask;
-mod slice_mut;
+pub mod slice;
 mod vector;
 
 /// Function for filtering based on a selection mask.
