@@ -207,6 +207,8 @@ pub(crate) fn can_be_pushed_down(df_expr: &PhysicalExprRef, schema: &Schema) -> 
         return false;
     }
 
+    let _expr_str = format!("{:?}", df_expr);
+
     let expr = df_expr.as_any();
     if let Some(binary) = expr.downcast_ref::<df_expr::BinaryExpr>() {
         can_binary_be_pushed_down(binary, schema)
@@ -270,6 +272,7 @@ fn supported_data_types(dt: &DataType) -> bool {
                 | Timestamp(_, _)
                 | Time32(_)
                 | Time64(_)
+                | Struct(_)
         );
 
     if !is_supported {
