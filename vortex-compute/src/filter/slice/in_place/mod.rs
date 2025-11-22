@@ -6,6 +6,7 @@
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx512;
 
+// TODO(connor): This is super inefficient.
 /// Filter a mutable slice of elements in-place depending on the given mask.
 ///
 /// The mask is represented as a slice of bytes (LSB is the first element).

@@ -8,6 +8,9 @@ use rand::Rng;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use vortex_compute::filter::slice::in_place::avx512::filter_in_place_avx512;
 use vortex_compute::filter::slice::in_place::filter_in_place_scalar;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use vortex_compute::filter::slice::out::avx512::filter_into_avx512;
+use vortex_compute::filter::slice::out::filter_into_scalar;
 
 fn main() {
     divan::main();
@@ -32,14 +35,17 @@ fn create_random_mask(size: usize, probability: f64) -> Vec<u8> {
     mask
 }
 
-// Benchmark different data sizes.
-const SIZES: &[usize] = &[1 << 10, 1 << 14, 1 << 17];
+/// Benchmark different data sizes.
+const SIZES: &[usize] = &[1 << 10, 1 << 11, 1 << 14, 1 << 17];
 
-// Different probability values to benchmark.
+/// Different probability values to benchmark.
 const PROBABILITIES: &[f64] = &[0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
 
-#[divan::bench(sample_size = 64, args = SIZES.iter().copied().cartesian_product(PROBABILITIES.iter().copied()))]
-fn random_probability_scalar(bencher: divan::Bencher, (size, probability): (usize, f64)) {
+/// The number of samples per benchmark.
+const SAMPLE_SIZE: u32 = 64;
+
+#[divan::bench(sample_size = SAMPLE_SIZE, args = SIZES.iter().copied().cartesian_product(PROBABILITIES.iter().copied()))]
+fn in_place_scalar(bencher: divan::Bencher, (size, probability): (usize, f64)) {
     let mask = create_random_mask(size, probability);
     bencher
         .with_inputs(|| (0..size as i32).collect::<Vec<_>>())
@@ -47,31 +53,35 @@ fn random_probability_scalar(bencher: divan::Bencher, (size, probability): (usiz
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[divan::bench(sample_size = 64, args = SIZES.iter().copied().cartesian_product(PROBABILITIES.iter().copied()))]
-fn random_probability_avx512(bencher: divan::Bencher, (size, probability): (usize, f64)) {
+#[divan::bench(sample_size = SAMPLE_SIZE, args = SIZES.iter().copied().cartesian_product(PROBABILITIES.iter().copied()))]
+fn in_place_avx512(bencher: divan::Bencher, (size, probability): (usize, f64)) {
     let mask = create_random_mask(size, probability);
     bencher
         .with_inputs(|| (0..size as i32).collect::<Vec<_>>())
         .bench_values(|mut data| unsafe { filter_in_place_avx512(&mut data, &mask) })
 }
 
-const LARGE_SIZE: usize = 1024 * 1024; // 4 MB
-
-#[divan::bench(sample_size = 16, args = PROBABILITIES)]
-fn scalar_throughput(bencher: divan::Bencher, probability: f64) {
-    let mask = create_random_mask(LARGE_SIZE, probability);
+#[divan::bench(sample_size = SAMPLE_SIZE, args = SIZES.iter().copied().cartesian_product(PROBABILITIES.iter().copied()))]
+fn out_scalar(bencher: divan::Bencher, (size, probability): (usize, f64)) {
+    let mask = create_random_mask(size, probability);
     bencher
-        .counter(divan::counter::BytesCount::new(LARGE_SIZE * 4))
-        .with_inputs(|| (0..LARGE_SIZE as i32).collect::<Vec<_>>())
-        .bench_values(|mut data| filter_in_place_scalar(&mut data, &mask))
+        .with_inputs(|| {
+            let src = (0..size as i32).collect::<Vec<_>>();
+            let dest = vec![0i32; size];
+            (src, dest)
+        })
+        .bench_values(|(src, mut dest)| filter_into_scalar(&src, &mut dest, &mask))
 }
 
-#[divan::bench(sample_size = 16, args = PROBABILITIES)]
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn avx512_throughput(bencher: divan::Bencher, probability: f64) {
-    let mask = create_random_mask(LARGE_SIZE, probability);
+#[divan::bench(sample_size = SAMPLE_SIZE, args = SIZES.iter().copied().cartesian_product(PROBABILITIES.iter().copied()))]
+fn out_avx512(bencher: divan::Bencher, (size, probability): (usize, f64)) {
+    let mask = create_random_mask(size, probability);
     bencher
-        .counter(divan::counter::BytesCount::new(LARGE_SIZE * 4))
-        .with_inputs(|| (0..LARGE_SIZE as i32).collect::<Vec<_>>())
-        .bench_values(|mut data| unsafe { filter_in_place_avx512(&mut data, &mask) })
+        .with_inputs(|| {
+            let src = (0..size as i32).collect::<Vec<_>>();
+            let dest = vec![0i32; size];
+            (src, dest)
+        })
+        .bench_values(|(src, mut dest)| unsafe { filter_into_avx512(&src, &mut dest, &mask) })
 }
