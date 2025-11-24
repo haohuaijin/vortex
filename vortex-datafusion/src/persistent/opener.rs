@@ -38,7 +38,7 @@ use vortex::expr::root;
 use vortex::expr::select;
 use vortex::layout::LayoutReader;
 use vortex::metrics::VortexMetrics;
-use vortex::scan::ScanBuilder;
+use vortex::scan::{ScanBuilder, Selection};
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
@@ -99,6 +99,7 @@ impl FileOpener for VortexOpener {
         let metrics = self.metrics.clone();
         let layout_reader = self.layout_readers.clone();
         let has_output_ordering = self.has_output_ordering;
+        let extensions = file.extensions.clone();
 
         let projected_schema = match projection.as_ref() {
             None => table_schema.file_schema().clone(),
@@ -228,6 +229,9 @@ impl FileOpener for VortexOpener {
             };
 
             let mut scan_builder = ScanBuilder::new(session, layout_reader);
+            if let Some(initial_plan) = create_initial_plan(extensions) {
+                scan_builder = scan_builder.with_selection(initial_plan);
+            }
             if let Some(file_range) = file.range {
                 scan_builder = apply_byte_range(
                     file_range,
@@ -348,6 +352,17 @@ fn byte_range_to_row_range(byte_range: Range<u64>, row_count: u64, total_size: u
 
     // We take the min here as `end_row` might overshoot
     start_row..u64::min(row_count, end_row)
+}
+
+fn create_initial_plan(
+    extensions: Option<Arc<dyn std::any::Any + Send + Sync>>,
+) -> Option<Selection> {
+    if let Some(extensions) = extensions
+        && let Some(selection) = extensions.downcast_ref::<Selection>()
+    {
+        return Some(selection.clone());
+    }
+    None
 }
 
 #[cfg(test)]
