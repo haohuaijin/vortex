@@ -251,7 +251,7 @@ impl FileOpener for VortexOpener {
             let fields = adapted_projections
                 .iter()
                 .map(|idx| {
-                    let field = logical_schema.field(*idx);
+                    let field = physical_file_schema.field(*idx);
                     FieldName::from(field.name().as_str())
                 })
                 .collect::<Vec<_>>();
