@@ -91,6 +91,7 @@ impl FileOpener for VortexOpener {
         let mut filter = self.filter.clone();
         let file_pruning_predicate = self.file_pruning_predicate.clone();
         let expr_adapter_factory = self.expr_adapter_factory.clone();
+
         let file_cache = self.file_cache.clone();
         let table_schema = self.table_schema.clone();
         let batch_size = self.batch_size;
@@ -159,6 +160,12 @@ impl FileOpener for VortexOpener {
 
             if let Some(expr_adapter_factory) = expr_adapter_factory {
                 // Replace column access for partition columns with literals
+                let partition_values = table_schema
+                    .table_partition_cols()
+                    .iter()
+                    .cloned()
+                    .zip(file.partition_values)
+                    .collect();
 
                 // The adapter rewrites the expression to the local file schema, allowing
                 // for schema evolution and divergence between the table's schema and individual files.
@@ -169,14 +176,7 @@ impl FileOpener for VortexOpener {
                                 Arc::clone(table_schema.file_schema()),
                                 Arc::clone(&physical_file_schema),
                             )
-                            .with_partition_values(
-                                table_schema
-                                    .table_partition_cols()
-                                    .iter()
-                                    .cloned()
-                                    .zip(file.partition_values.iter().cloned())
-                                    .collect(),
-                            )
+                            .with_partition_values(partition_values)
                             .rewrite(filter)?;
 
                         // Expression might now reference columns that don't exist in the file, so we can give it
@@ -264,10 +264,6 @@ impl FileOpener for VortexOpener {
                         )));
                     }
 
-                    for filter in pushed.iter() {
-                        println!("- pushing: {filter}");
-                    }
-
                     make_vortex_predicate(&pushed).transpose()
                 })
                 .transpose()
@@ -327,7 +323,7 @@ impl FileOpener for VortexOpener {
     }
 }
 
-/// If the file has a [`FileRange`](datafusion::datasource::listing::FileRange), we translate it into a row range in the file for the scan.
+/// If the file has a [`FileRange`], we translate it into a row range in the file for the scan.
 fn apply_byte_range(
     file_range: FileRange,
     total_size: u64,
@@ -386,6 +382,7 @@ mod tests {
     use vortex::session::VortexSession;
 
     use super::*;
+    use crate::vendor::schema_rewriter::DF52PhysicalExprAdapterFactory;
 
     static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::default);
 
@@ -477,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_with_adapter() -> anyhow::Result<()> {
         let expr_adapter_factory: Arc<dyn PhysicalExprAdapterFactory> =
-            Arc::new(DefaultPhysicalExprAdapterFactory);
+            Arc::new(DF52PhysicalExprAdapterFactory);
 
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "part=1/file.vortex";
@@ -780,7 +777,7 @@ mod tests {
                 &col("my_struct").is_not_null(),
                 table_schema.table_schema(),
             )),
-            Some(Arc::new(DefaultPhysicalExprAdapterFactory) as _),
+            Some(Arc::new(DF52PhysicalExprAdapterFactory) as _),
         );
 
         // The opener should be able to open the file with a filter on the
