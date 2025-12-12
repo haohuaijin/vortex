@@ -9377,6 +9377,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "url",
  "vortex",
  "vortex-utils",
  "walkdir",
