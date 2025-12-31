@@ -34,6 +34,7 @@ fn register_vortex_format_factory(
 
 #[cfg(test)]
 mod tests {
+
     use std::sync::Arc;
 
     use arrow_schema::DataType;
@@ -206,48 +207,39 @@ mod tests {
 
     #[tokio::test]
     async fn create_table_ordered_by() -> anyhow::Result<()> {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new()?;
 
         let factory: VortexFormatFactory = VortexFormatFactory::new();
         let mut session_state_builder = SessionStateBuilder::new().with_default_features();
         register_vortex_format_factory(factory, &mut session_state_builder);
         let session = SessionContext::new_with_state(session_state_builder.build());
 
-        // Vortex
         session
             .sql(&format!(
-                "CREATE EXTERNAL TABLE my_tbl_vx \
+                "CREATE EXTERNAL TABLE my_tbl \
                 (c1 VARCHAR NOT NULL, c2 INT NOT NULL) \
-                STORED AS vortex  \
+                STORED AS VORTEX  \
                 WITH ORDER (c1 ASC)
-                LOCATION '{}/vx/'",
+                LOCATION '{}/'",
                 dir.path().to_str().unwrap()
             ))
             .await?;
 
         session
-            .sql("INSERT INTO my_tbl_vx VALUES ('air', 5), ('balloon', 42)")
+            .sql("INSERT INTO my_tbl VALUES ('air', 10), ('alabama', 20), ('balloon', 30)")
             .await?
             .collect()
             .await?;
 
         session
-            .sql("INSERT INTO my_tbl_vx VALUES ('zebra', 5)")
+            .sql("INSERT INTO my_tbl VALUES ('kangaroo', 11), ('zebra', 21)")
             .await?
             .collect()
             .await?;
 
-        session
-            .sql("INSERT INTO my_tbl_vx VALUES ('texas', 2000), ('alabama', 2000)")
-            .await?
-            .collect()
-            .await?;
+        let df = session.sql("SELECT * FROM my_tbl ORDER BY c1 ASC").await?;
 
-        let df = session
-            .sql("SELECT * FROM my_tbl_vx ORDER BY c1 ASC limit 3")
-            .await?;
-        let (state, plan) = df.clone().into_parts();
-        let physical_plan = state.create_physical_plan(&plan).await?;
+        let physical_plan = df.clone().create_physical_plan().await?;
 
         insta::assert_snapshot!(DisplayableExecutionPlan::new(physical_plan.as_ref())
                 .tree_render().to_string(), @r"
@@ -255,13 +247,11 @@ mod tests {
         │  SortPreservingMergeExec  │
         │    --------------------   │
         │     c1 ASC NULLS LAST     │
-        │                           │
-        │          limit: 3         │
         └─────────────┬─────────────┘
         ┌─────────────┴─────────────┐
         │       DataSourceExec      │
         │    --------------------   │
-        │          files: 3         │
+        │          files: 2         │
         │       format: vortex      │
         └───────────────────────────┘
         ");
@@ -269,13 +259,15 @@ mod tests {
         let r = df.collect().await?;
 
         insta::assert_snapshot!(pretty_format_batches(&r)?.to_string(), @r"
-        +---------+------+
-        | c1      | c2   |
-        +---------+------+
-        | air     | 5    |
-        | alabama | 2000 |
-        | balloon | 42   |
-        +---------+------+
+        +----------+----+
+        | c1       | c2 |
+        +----------+----+
+        | air      | 10 |
+        | alabama  | 20 |
+        | balloon  | 30 |
+        | kangaroo | 11 |
+        | zebra    | 21 |
+        +----------+----+
         ");
 
         Ok(())

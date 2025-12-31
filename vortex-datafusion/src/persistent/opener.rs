@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use arrow_schema::ArrowError;
+use arrow_schema::DataType;
+use arrow_schema::Field;
+use arrow_schema::SchemaRef;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::arrow::array::RecordBatch;
@@ -32,13 +35,12 @@ use tracing::Instrument;
 use vortex::array::ArrayRef;
 use vortex::dtype::FieldName;
 use vortex::error::VortexError;
-use vortex::error::VortexResult;
-use vortex::error::vortex_err;
 use vortex::expr::root;
 use vortex::expr::select;
 use vortex::layout::LayoutReader;
 use vortex::metrics::VortexMetrics;
-use vortex::scan::{ScanBuilder, Selection};
+use vortex::scan::ScanBuilder;
+use vortex::scan::Selection;
 use vortex::session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
 use vortex_utils::aliases::dash_map::Entry;
@@ -47,20 +49,96 @@ use super::cache::VortexFileCache;
 use crate::convert::exprs::can_be_pushed_down;
 use crate::convert::exprs::make_vortex_predicate;
 
+/// Merges the data types of two fields, preferring the logical type from the
+/// table field.
+fn merge_field_types(physical_field: &Field, table_field: &Field) -> DataType {
+    match (physical_field.data_type(), table_field.data_type()) {
+        (DataType::Struct(phys_fields), DataType::Struct(table_fields)) => {
+            let merged_fields = merge_fields(phys_fields, table_fields);
+            DataType::Struct(merged_fields.into())
+        }
+        (DataType::List(phys_field), DataType::List(table_field)) => {
+            DataType::List(Arc::new(Field::new(
+                phys_field.name(),
+                merge_field_types(phys_field, table_field),
+                phys_field.is_nullable(),
+            )))
+        }
+        (DataType::LargeList(phys_field), DataType::LargeList(table_field)) => {
+            DataType::LargeList(Arc::new(Field::new(
+                phys_field.name(),
+                merge_field_types(phys_field, table_field),
+                phys_field.is_nullable(),
+            )))
+        }
+        _ => table_field.data_type().clone(),
+    }
+}
+
+/// Merges two field collections, using logical types from table_fields where available.
+/// Falls back to physical field types when no matching table field is found.
+fn merge_fields(
+    physical_fields: &arrow_schema::Fields,
+    table_fields: &arrow_schema::Fields,
+) -> Vec<Field> {
+    physical_fields
+        .iter()
+        .map(|phys_field| {
+            table_fields
+                .iter()
+                .find(|f| f.name() == phys_field.name())
+                .map(|table_field| {
+                    Field::new(
+                        phys_field.name(),
+                        merge_field_types(phys_field, table_field),
+                        phys_field.is_nullable(),
+                    )
+                })
+                .unwrap_or_else(|| (**phys_field).clone())
+        })
+        .collect()
+}
+
+/// Computes a logical file schema from the physical file schema and the table
+/// schema.
+///
+/// For each field in the physical file schema, looks up the corresponding field
+/// in the table schema and uses its logical type.
+fn compute_logical_file_schema(
+    physical_file_schema: &SchemaRef,
+    table_schema: &SchemaRef,
+) -> SchemaRef {
+    let logical_fields: Vec<Field> = physical_file_schema
+        .fields()
+        .iter()
+        .map(|physical_field| {
+            table_schema
+                .fields()
+                .find(physical_field.name())
+                .map(|(_, table_field)| {
+                    Field::new(
+                        physical_field.name(),
+                        merge_field_types(physical_field, table_field),
+                        physical_field.is_nullable(),
+                    )
+                    .with_metadata(physical_field.metadata().clone())
+                })
+                .unwrap_or_else(|| (**physical_field).clone())
+        })
+        .collect();
+
+    Arc::new(arrow_schema::Schema::new(logical_fields))
+}
+
 #[derive(Clone)]
 pub(crate) struct VortexOpener {
     pub session: VortexSession,
     pub object_store: Arc<dyn ObjectStore>,
-    /// Optional table schema projection. The indices are w.r.t. the `table_schema`, which is
-    /// all fields in the final scan result not including the partition columns.
+    /// Projection by index of the file's columns
     pub projection: Option<Arc<[usize]>>,
-    /// Filter expression optimized for pushdown into Vortex scan operations.
-    /// This may be a subset of file_pruning_predicate containing only expressions
-    /// that Vortex can efficiently evaluate.
-    pub filter: Option<PhysicalExprRef>,
     /// Filter expression used by DataFusion's FilePruner to eliminate files based on
     /// statistics and partition values without opening them.
-    pub file_pruning_predicate: Option<PhysicalExprRef>,
+    pub predicate: Option<PhysicalExprRef>,
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     pub schema_adapter_factory: Arc<dyn SchemaAdapterFactory>,
     /// This is the table's schema without partition columns. It may contain fields which do
@@ -88,8 +166,7 @@ impl FileOpener for VortexOpener {
         let session = self.session.clone();
         let object_store = self.object_store.clone();
         let projection = self.projection.clone();
-        let mut filter = self.filter.clone();
-        let file_pruning_predicate = self.file_pruning_predicate.clone();
+        let mut predicate = self.predicate.clone();
         let expr_adapter_factory = self.expr_adapter_factory.clone();
 
         let file_cache = self.file_cache.clone();
@@ -123,7 +200,8 @@ impl FileOpener for VortexOpener {
             // opening them based on:
             // - Partition column values (e.g., date=2024-01-01)
             // - File-level statistics (min/max values per column)
-            let mut file_pruner = file_pruning_predicate
+            let mut file_pruner = predicate
+                .clone()
                 .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
@@ -168,17 +246,18 @@ impl FileOpener for VortexOpener {
                     .zip(file.partition_values)
                     .collect();
 
+                let logical_file_schema =
+                    compute_logical_file_schema(&physical_file_schema, table_schema.file_schema());
+
                 // The adapter rewrites the expression to the local file schema, allowing
                 // for schema evolution and divergence between the table's schema and individual files.
-                filter = filter
-                    .map(|filter| {
+                predicate = predicate
+                    .clone()
+                    .map(|expr| {
                         let expr = expr_adapter_factory
-                            .create(
-                                Arc::clone(table_schema.file_schema()),
-                                Arc::clone(&physical_file_schema),
-                            )
+                            .create(logical_file_schema, physical_file_schema.clone())
                             .with_partition_values(partition_values)
-                            .rewrite(filter)?;
+                            .rewrite(expr)?;
 
                         // Expression might now reference columns that don't exist in the file, so we can give it
                         // another simplification pass.
@@ -241,34 +320,18 @@ impl FileOpener for VortexOpener {
                 );
             }
 
-            let filter = filter
+            let filter = predicate
                 .and_then(|f| {
-                    // Verify that all filters we've accepted from DataFusion get pushed down.
-                    // This will only fail if the user has not configured a suitable
-                    // PhysicalExprAdapterFactory on the file source to handle rewriting the
-                    // expression to handle missing/reordered columns in the Vortex file.
+                    let exprs = split_conjunction(&f)
+                        .into_iter()
+                        .filter(|expr| {
+                            is_dynamic_physical_expr(expr)
+                                || can_be_pushed_down(expr, &physical_file_schema)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
 
-                    let (pushed, unpushed): (Vec<PhysicalExprRef>, Vec<PhysicalExprRef>) =
-                        split_conjunction(&f)
-                            .into_iter()
-                            .cloned()
-                            .partition(|expr| can_be_pushed_down(expr, &physical_file_schema));
-
-                    if !unpushed.is_empty() {
-                        return Some(VortexResult::Err(vortex_err!(
-                            r#"VortexSource accepted but failed to push {} filters.
-                            This should never happen if you have a properly configured
-                            PhysicalExprAdapterFactory configured on the source.
-
-                            Failed filters:
-
-                            {unpushed:#?}
-                            "#,
-                            unpushed.len()
-                        )));
-                    }
-
-                    make_vortex_predicate(&pushed).transpose()
+                    make_vortex_predicate(&exprs).transpose()
                 })
                 .transpose()
                 .map_err(|e| DataFusionError::External(e.into()))?;
@@ -471,9 +534,7 @@ mod tests {
             session: SESSION.clone(),
             object_store,
             projection: Some([0].into()),
-            filter,
-            file_pruning_predicate: None,
-            // no adapter
+            predicate: filter,
             expr_adapter_factory,
             schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
             file_cache: VortexFileCache::new(1, 1, SESSION.clone()),
@@ -617,8 +678,7 @@ mod tests {
             session: SESSION.clone(),
             object_store: object_store.clone(),
             projection: Some([0].into()),
-            filter: Some(filter),
-            file_pruning_predicate: None,
+            predicate: Some(filter),
             expr_adapter_factory: expr_adapter_factory.clone(),
             schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
             file_cache: VortexFileCache::new(1, 1, SESSION.clone()),
@@ -700,8 +760,7 @@ mod tests {
             session: SESSION.clone(),
             object_store: object_store.clone(),
             projection: Some([0, 1, 2].into()),
-            filter: None,
-            file_pruning_predicate: None,
+            predicate: None,
             expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory) as _),
             schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
             file_cache: VortexFileCache::new(1, 1, SESSION.clone()),
@@ -852,8 +911,7 @@ mod tests {
             session: SESSION.clone(),
             object_store: object_store.clone(),
             projection: Some(projection.into()),
-            filter: None,
-            file_pruning_predicate: None,
+            predicate: None,
             expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory) as _),
             schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
             file_cache: VortexFileCache::new(1, 1, SESSION.clone()),

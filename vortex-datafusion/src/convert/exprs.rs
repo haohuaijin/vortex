@@ -5,11 +5,14 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use arrow_schema::Schema;
+use datafusion_common::ScalarValue;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::ScalarFunctionExpr;
 use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
+use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::compute::LikeOptions;
@@ -37,13 +40,44 @@ use vortex::scalar::Scalar;
 use crate::convert::FromDataFusion;
 use crate::convert::TryFromDataFusion;
 
+fn is_lit_true(e: &PhysicalExprRef) -> bool {
+    e.as_any()
+        .downcast_ref::<df_expr::Literal>()
+        .is_some_and(|l| matches!(l.value(), ScalarValue::Boolean(Some(true))))
+}
+
 /// Tries to convert the expressions into a vortex conjunction. Will return Ok(None) iff the input conjunction is empty.
 pub(crate) fn make_vortex_predicate(
     predicate: &[Arc<dyn PhysicalExpr>],
 ) -> VortexResult<Option<Expression>> {
     let exprs = predicate
         .iter()
-        .map(|e| Expression::try_from_df(e.as_ref()))
+        .filter_map(|expr| {
+            // Handle dynamic expressions by snapshotting them first
+            let expr_to_convert = if is_dynamic_physical_expr(expr) {
+                // If snapshot fails, filter out this expression
+                let snapshot = snapshot_physical_expr(expr.clone()).ok()?;
+
+                // Filter out literal true expressions (they don't add constraints)
+                if is_lit_true(&snapshot) {
+                    return None;
+                }
+
+                snapshot
+            } else {
+                expr.clone()
+            };
+
+            // Try to convert to Vortex expression
+            match Expression::try_from_df(expr_to_convert.as_ref()) {
+                Ok(vortex_expr) => Some(Ok(vortex_expr)),
+                Err(_) => {
+                    // If we fail to convert the expression to Vortex, it's safe
+                    // to drop it as we don't declare it as pushed down
+                    None
+                }
+            }
+        })
         .collect::<VortexResult<Vec<_>>>()?;
 
     Ok(exprs.into_iter().reduce(and))

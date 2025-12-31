@@ -19,11 +19,11 @@ use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
+use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::PhysicalExpr;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
-use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use object_store::ObjectStore;
 use object_store::path::Path;
@@ -49,10 +49,7 @@ pub struct VortexSource {
     pub(crate) file_cache: VortexFileCache,
     /// Combined predicate expression containing all filters from DataFusion query planning.
     /// Used with FilePruner to skip files based on statistics and partition values.
-    pub(crate) full_predicate: Option<PhysicalExprRef>,
-    /// Subset of predicates that can be pushed down into Vortex scan operations.
-    /// These are expressions that Vortex can efficiently evaluate during scanning.
-    pub(crate) vortex_predicate: Option<PhysicalExprRef>,
+    pub(crate) predicate: Option<PhysicalExprRef>,
     pub(crate) batch_size: Option<usize>,
     pub(crate) projected_statistics: Option<Statistics>,
     pub(crate) table_schema: Option<TableSchema>,
@@ -70,8 +67,7 @@ impl VortexSource {
         Self {
             session,
             file_cache,
-            full_predicate: None,
-            vortex_predicate: None,
+            predicate: None,
             batch_size: None,
             projected_statistics: None,
             table_schema: None,
@@ -139,8 +135,8 @@ impl FileSource for VortexSource {
             session: self.session.clone(),
             object_store,
             projection,
-            filter: self.vortex_predicate.clone(),
-            file_pruning_predicate: self.full_predicate.clone(),
+
+            predicate: self.predicate.clone(),
             expr_adapter_factory,
             schema_adapter_factory,
             table_schema,
@@ -182,7 +178,7 @@ impl FileSource for VortexSource {
     }
 
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
-        self.vortex_predicate.clone()
+        self.predicate.clone()
     }
 
     fn metrics(&self) -> &ExecutionPlanMetricsSet {
@@ -195,7 +191,7 @@ impl FileSource for VortexSource {
             .clone()
             .vortex_expect("projected_statistics must be set");
 
-        if self.vortex_predicate.is_some() {
+        if self.predicate.is_some() {
             Ok(statistics.to_inexact())
         } else {
             Ok(statistics)
@@ -209,13 +205,13 @@ impl FileSource for VortexSource {
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                if let Some(ref predicate) = self.vortex_predicate {
+                if let Some(ref predicate) = self.predicate {
                     write!(f, ", predicate: {predicate}")?;
                 }
             }
             // Use TreeRender style key=value formatting to display the predicate
             DisplayFormatType::TreeRender => {
-                if let Some(ref predicate) = self.vortex_predicate {
+                if let Some(ref predicate) = self.predicate {
                     writeln!(f, "predicate={}", fmt_sql(predicate.as_ref()))?;
                 };
             }
@@ -242,57 +238,44 @@ impl FileSource for VortexSource {
 
         let mut source = self.clone();
 
-        // Combine new filters with existing predicate for file pruning.
-        // This full predicate is used by FilePruner to eliminate files.
-        source.full_predicate = match source.full_predicate {
-            Some(predicate) => Some(conjunction(
-                std::iter::once(predicate).chain(filters.clone()),
-            )),
-            None => Some(conjunction(filters.clone())),
-        };
-
-        let supported_filters = filters
-            .into_iter()
+        let supported = filters
+            .iter()
             .map(|expr| {
-                if can_be_pushed_down(&expr, table_schema.file_schema()) {
-                    PushedDownPredicate::supported(expr)
+                if can_be_pushed_down(expr, table_schema.file_schema()) {
+                    PushedDown::Yes
                 } else {
-                    PushedDownPredicate::unsupported(expr)
+                    PushedDown::No
                 }
             })
             .collect::<Vec<_>>();
 
-        if supported_filters
+        // We keep expressions we can push down dynamic expression that will be evaluated on a best-effort basis.
+        let saved_filters = filters
             .iter()
-            .all(|p| matches!(p.discriminant, PushedDown::No))
-        {
+            .filter(|expr| {
+                can_be_pushed_down(expr, table_schema.file_schema())
+                    || is_dynamic_physical_expr(expr)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // If we don't push down any filter, we don't need to update the plan's node.
+        if saved_filters.is_empty() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; supported_filters.len()],
-            )
-            .with_updated_node(Arc::new(source) as _));
+                supported,
+            ));
         }
 
-        let supported = supported_filters
-            .iter()
-            .filter_map(|p| match p.discriminant {
-                PushedDown::Yes => Some(&p.predicate),
-                PushedDown::No => None,
-            })
-            .cloned();
-
-        let predicate = match source.vortex_predicate {
-            Some(predicate) => conjunction(std::iter::once(predicate).chain(supported)),
-            None => conjunction(supported),
+        // Combine new filters with existing predicate. We keep the whole original expression
+        source.predicate = match source.predicate {
+            Some(predicate) => Some(conjunction(std::iter::once(predicate).chain(saved_filters))),
+            None => Some(conjunction(saved_filters)),
         };
 
-        tracing::debug!(%predicate, "Saving predicate");
-
-        source.vortex_predicate = Some(predicate);
-
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            supported_filters.iter().map(|f| f.discriminant).collect(),
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(supported)
+                .with_updated_node(Arc::new(source) as _),
         )
-        .with_updated_node(Arc::new(source) as _))
     }
 
     fn with_schema_adapter_factory(
