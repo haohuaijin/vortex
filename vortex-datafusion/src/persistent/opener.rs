@@ -24,6 +24,11 @@ use datafusion_physical_expr::split_conjunction;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::metrics::Count;
+use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::MetricBuilder;
+use datafusion_physical_plan::metrics::MetricType;
+use datafusion_physical_plan::metrics::PruningMetrics;
+use datafusion_physical_plan::metrics::Time;
 use datafusion_pruning::FilePruner;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -130,6 +135,40 @@ fn compute_logical_file_schema(
     Arc::new(arrow_schema::Schema::new(logical_fields))
 }
 
+/// Metrics for a single Vortex file being opened.
+struct VortexFileMetrics {
+    /// Time spent loading file metadata
+    metadata_load_time: Time,
+    /// Metrics for files pruned based on statistics
+    files_ranges_pruned_statistics: PruningMetrics,
+    /// Counter for predicate creation errors
+    num_predicate_creation_errors: Count,
+}
+
+impl VortexFileMetrics {
+    /// Create new file metrics for a specific file.
+    fn new(partition_index: usize, file_name: &str, metrics: &ExecutionPlanMetricsSet) -> Self {
+        let metadata_load_time = MetricBuilder::new(metrics)
+            .with_new_label("filename", file_name.to_string())
+            .with_type(MetricType::SUMMARY)
+            .subset_time("metadata_load_time", partition_index);
+
+        let files_ranges_pruned_statistics = MetricBuilder::new(metrics)
+            .with_type(MetricType::SUMMARY)
+            .pruning_metrics("files_ranges_pruned_statistics", partition_index);
+
+        let num_predicate_creation_errors = MetricBuilder::new(metrics)
+            .with_new_label("filename", file_name.to_string())
+            .counter("num_predicate_creation_errors", partition_index);
+
+        Self {
+            metadata_load_time,
+            files_ranges_pruned_statistics,
+            num_predicate_creation_errors,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct VortexOpener {
     pub session: VortexSession,
@@ -152,6 +191,10 @@ pub(crate) struct VortexOpener {
     pub limit: Option<usize>,
     /// A metrics object for tracking performance of the scan.
     pub metrics: VortexMetrics,
+    /// DataFusion execution plan metrics set for reporting metrics to DataFusion.
+    pub df_metrics: ExecutionPlanMetricsSet,
+    /// Execution partition index
+    pub partition_index: usize,
     /// A shared cache of file readers.
     ///
     /// To save on the overhead of reparsing FlatBuffers and rebuilding the layout tree, we cache
@@ -174,6 +217,8 @@ impl FileOpener for VortexOpener {
         let batch_size = self.batch_size;
         let limit = self.limit;
         let metrics = self.metrics.clone();
+        let df_metrics = self.df_metrics.clone();
+        let partition_index = self.partition_index;
         let layout_reader = self.layout_readers.clone();
         let has_output_ordering = self.has_output_ordering;
         let extensions = file.extensions.clone();
@@ -183,7 +228,7 @@ impl FileOpener for VortexOpener {
             Some(indices) => Arc::new(table_schema.file_schema().project(indices)?),
         };
 
-        let _file_name = file.object_meta.location.to_string();
+        let file_name = file.object_meta.location.to_string();
         let _schema = projected_schema.to_string();
 
         let schema_adapter = self
@@ -195,6 +240,8 @@ impl FileOpener for VortexOpener {
         let table_schema = self.table_schema.clone();
 
         Ok(async move {
+            let file_metrics = VortexFileMetrics::new(partition_index, &file_name, &df_metrics);
+
             // Create FilePruner when we have a predicate and either dynamic expressions
             // or file statistics available. The pruner can eliminate files without
             // opening them based on:
@@ -213,7 +260,7 @@ impl FileOpener for VortexOpener {
                         table_schema.file_schema(),
                         partition_fields,
                         file.clone(),
-                        Count::default(),
+                        file_metrics.num_predicate_creation_errors.clone(),
                     )
                 })
                 .transpose()?;
@@ -223,8 +270,13 @@ impl FileOpener for VortexOpener {
             if let Some(file_pruner) = &mut file_pruner
                 && file_pruner.should_prune()?
             {
+                file_metrics.files_ranges_pruned_statistics.add_pruned(1);
                 return Ok(stream::empty().boxed());
             }
+
+            file_metrics.files_ranges_pruned_statistics.add_matched(1);
+
+            let mut metadata_timer = file_metrics.metadata_load_time.timer();
 
             let vxf = file_cache
                 .try_get(&file.object_meta, object_store)
@@ -236,6 +288,8 @@ impl FileOpener for VortexOpener {
             let physical_file_schema = Arc::new(vxf.dtype().to_arrow_schema().map_err(|e| {
                 DataFusionError::Execution(format!("Failed to convert file schema to arrow: {e}"))
             })?);
+
+            metadata_timer.stop();
 
             if let Some(expr_adapter_factory) = expr_adapter_factory {
                 // Replace column access for partition columns with literals
@@ -542,6 +596,8 @@ mod tests {
             batch_size: 100,
             limit: None,
             metrics: Default::default(),
+            df_metrics: Default::default(),
+            partition_index: 0,
             layout_readers: Default::default(),
             has_output_ordering: false,
         }
@@ -686,6 +742,8 @@ mod tests {
             batch_size: 100,
             limit: None,
             metrics: Default::default(),
+            df_metrics: Default::default(),
+            partition_index: 0,
             layout_readers: Default::default(),
             has_output_ordering: false,
         };
@@ -768,6 +826,8 @@ mod tests {
             batch_size: 100,
             limit: None,
             metrics: Default::default(),
+            df_metrics: Default::default(),
+            partition_index: 0,
             layout_readers: Default::default(),
             has_output_ordering: false,
         };
@@ -919,6 +979,8 @@ mod tests {
             batch_size: 100,
             limit: None,
             metrics: Default::default(),
+            df_metrics: Default::default(),
+            partition_index: 0,
             layout_readers: Default::default(),
             has_output_ordering: false,
         };
