@@ -31,6 +31,7 @@ use datafusion_physical_plan::metrics::PruningMetrics;
 use datafusion_physical_plan::metrics::Time;
 use datafusion_pruning::FilePruner;
 use futures::FutureExt;
+use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream;
@@ -437,10 +438,98 @@ impl FileOpener for VortexOpener {
                 .map(move |batch| batch.and_then(|b| schema_mapping.map_batch(b)))
                 .boxed();
 
-            Ok(stream)
+            if let Some(file_pruner) = file_pruner {
+                Ok(EarlyStoppingStream::new(
+                    stream,
+                    file_pruner,
+                    file_metrics.files_ranges_pruned_statistics.clone(),
+                )
+                .boxed())
+            } else {
+                Ok(stream.boxed())
+            }
         }
         .in_current_span()
         .boxed())
+    }
+}
+
+/// Wraps an inner RecordBatchStream and a [`FilePruner`]
+///
+/// This can terminate the scan early when some dynamic filters is updated after
+/// the scan starts, so we discover after the scan starts that the file can be
+/// pruned (can't have matching rows).
+struct EarlyStoppingStream<S> {
+    /// Has the stream finished processing? All subsequent polls will return
+    /// None
+    done: bool,
+    file_pruner: FilePruner,
+    files_ranges_pruned_statistics: PruningMetrics,
+    /// The inner stream
+    inner: S,
+}
+
+impl<S> EarlyStoppingStream<S> {
+    pub fn new(
+        stream: S,
+        file_pruner: FilePruner,
+        files_ranges_pruned_statistics: PruningMetrics,
+    ) -> Self {
+        Self {
+            done: false,
+            inner: stream,
+            file_pruner,
+            files_ranges_pruned_statistics,
+        }
+    }
+}
+
+impl<S> EarlyStoppingStream<S>
+where
+    S: Stream<Item = DFResult<RecordBatch>> + Unpin,
+{
+    fn check_prune(&mut self, input: DFResult<RecordBatch>) -> DFResult<Option<RecordBatch>> {
+        let batch = input?;
+
+        // Since dynamic filters may have been updated, see if we can stop
+        // reading this stream entirely.
+        if self.file_pruner.should_prune()? {
+            self.files_ranges_pruned_statistics.add_pruned(1);
+            // Previously this file range has been counted as matched
+            self.files_ranges_pruned_statistics.subtract_matched(1);
+            self.done = true;
+            Ok(None)
+        } else {
+            // Return the adapted batch
+            Ok(Some(batch))
+        }
+    }
+}
+
+impl<S> Stream for EarlyStoppingStream<S>
+where
+    S: Stream<Item = DFResult<RecordBatch>> + Unpin,
+{
+    type Item = DFResult<RecordBatch>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.done {
+            return std::task::Poll::Ready(None);
+        }
+        match futures::ready!(self.inner.poll_next_unpin(cx)) {
+            None => {
+                // input done
+                self.done = true;
+                std::task::Poll::Ready(None)
+            }
+            Some(input_batch) => {
+                let output = self.check_prune(input_batch);
+                std::task::Poll::Ready(output.transpose())
+            }
+        }
     }
 }
 
