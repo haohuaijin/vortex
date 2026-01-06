@@ -386,7 +386,7 @@ impl FileOpener for VortexOpener {
                         .cloned()
                         .collect::<Vec<_>>();
 
-                    make_vortex_predicate(&exprs).transpose()
+                    make_vortex_predicate(&exprs, &physical_file_schema).transpose()
                 })
                 .transpose()
                 .map_err(|e| DataFusionError::External(e.into()))?;

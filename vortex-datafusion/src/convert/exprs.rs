@@ -5,14 +5,13 @@ use std::sync::Arc;
 
 use arrow_schema::DataType;
 use arrow_schema::Schema;
-use datafusion_common::ScalarValue;
+use datafusion_common::ScalarValue as DFScalarValue;
 use datafusion_expr::Operator as DFOperator;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::ScalarFunctionExpr;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
 use vortex::compute::LikeOptions;
@@ -29,6 +28,7 @@ use vortex::expr::Operator;
 use vortex::expr::VTableExt;
 use vortex::expr::and;
 use vortex::expr::cast;
+use vortex::expr::dynamic;
 use vortex::expr::get_item;
 use vortex::expr::is_null;
 use vortex::expr::list_contains;
@@ -36,40 +36,150 @@ use vortex::expr::lit;
 use vortex::expr::not;
 use vortex::expr::root;
 use vortex::scalar::Scalar;
+use vortex::scalar::ScalarValue as VortexScalarValue;
 
 use crate::convert::FromDataFusion;
 use crate::convert::TryFromDataFusion;
 
-fn is_lit_true(e: &PhysicalExprRef) -> bool {
-    e.as_any()
-        .downcast_ref::<df_expr::Literal>()
-        .is_some_and(|l| matches!(l.value(), ScalarValue::Boolean(Some(true))))
+/// Converts a DataFusion DynamicFilterPhysicalExpr into a Vortex dynamic expression.
+///
+/// The DynamicFilterPhysicalExpr wraps an entire comparison expression (e.g., `EventTime@4 < 1372720043000000`)
+/// that can be updated dynamically during query execution. It may start as `lit(true)` and later be updated
+/// to a real binary comparison.
+fn convert_dynamic_filter(
+    df_expr: Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> VortexResult<Expression> {
+    // Downcast to get the DynamicFilterPhysicalExpr
+    let df_dynamic = df_expr
+        .as_any()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .ok_or_else(|| vortex_err!("Expected DynamicFilterPhysicalExpr"))?;
+
+    // Get the current snapshot to extract initial structure
+    // Note: The dynamic filter may start as lit(true) and be updated later
+    let current_expr = df_dynamic
+        .current()
+        .map_err(|e| vortex_err!("Failed to get current dynamic filter expression: {}", e))?;
+
+    // We need to extract the structure from the children of the DynamicFilterPhysicalExpr
+    // The children represent the columns that will be referenced in the final expression
+    let children = df_dynamic.children();
+
+    // If we have children, use the first child as the LHS (typically a column reference)
+    let lhs = if !children.is_empty() {
+        Expression::try_from_df(children[0].as_ref())?
+    } else {
+        // Fallback: try to extract from current expression if it's already a binary expr
+        if let Some(binary) = current_expr.as_any().downcast_ref::<df_expr::BinaryExpr>() {
+            Expression::try_from_df(binary.left().as_ref())?
+        } else {
+            vortex_bail!("Dynamic filter has no children and current expression is not binary");
+        }
+    };
+
+    // Infer the LHS dtype from the DataFusion expression for use as RHS dtype default
+    let lhs_df_expr = if !children.is_empty() {
+        children[0].as_ref()
+    } else if let Some(binary) = current_expr.as_any().downcast_ref::<df_expr::BinaryExpr>() {
+        binary.left().as_ref()
+    } else {
+        vortex_bail!("Cannot determine LHS expression for dtype inference");
+    };
+
+    // Get the dtype from the LHS expression using the provided schema
+    let lhs_arrow_dtype = lhs_df_expr.data_type(schema).unwrap_or(DataType::Boolean);
+    let lhs_vortex_dtype = DType::from_arrow((&lhs_arrow_dtype, Nullability::Nullable));
+
+    // Try to infer the operator and dtype from current expression if it's a binary comparison
+    // Otherwise use defaults that will work when the filter is updated
+    let (compute_operator, rhs_dtype) =
+        match current_expr.as_any().downcast_ref::<df_expr::BinaryExpr>() {
+            Some(binary) => {
+                let operator = Operator::try_from_df(binary.op())?;
+                let compute_op: vortex::compute::Operator = operator.try_into()?;
+
+                let dtype =
+                    if let Some(lit) = binary.right().as_any().downcast_ref::<df_expr::Literal>() {
+                        let scalar = Scalar::from_df(lit.value());
+                        scalar.dtype().clone()
+                    } else {
+                        // Use the LHS dtype as a fallback
+                        lhs_vortex_dtype
+                    };
+
+                (compute_op, dtype)
+            }
+            None => {
+                // Default to Lt with the LHS dtype - Lt is commonly used for dynamic filters in TOP-K queries
+                // The actual operator will be determined by the real filter when it's updated
+                (vortex::compute::Operator::Lt, lhs_vortex_dtype)
+            }
+        };
+
+    // Capture the Arc<dyn PhysicalExpr> in the closure
+    let df_expr_clone = Arc::clone(&df_expr);
+    let rhs_closure = move || -> Option<VortexScalarValue> {
+        // Downcast to DynamicFilterPhysicalExpr
+        let dynamic_filter = df_expr_clone
+            .as_any()
+            .downcast_ref::<DynamicFilterPhysicalExpr>()?;
+
+        // Get the current expression from the dynamic filter
+        let current = dynamic_filter.current().ok()?;
+
+        // Check if it's still a placeholder (lit(true))
+        if let Some(literal) = current.as_any().downcast_ref::<df_expr::Literal>()
+            && matches!(literal.value(), DFScalarValue::Boolean(Some(true)))
+        {
+            // Return None to indicate no filter value is available yet
+            // The dynamic expression will use its default value
+            return None;
+        }
+
+        // Extract the binary expression
+        let binary = current.as_any().downcast_ref::<df_expr::BinaryExpr>()?;
+
+        // Extract the right-hand side literal value
+        let rhs = binary.right();
+        if let Some(lit) = rhs.as_any().downcast_ref::<df_expr::Literal>() {
+            let scalar = Scalar::from_df(lit.value());
+            Some(scalar.into_value())
+        } else {
+            None
+        }
+    };
+
+    // Default to true - if no value is available, the comparison returns true (matches everything)
+    // This is appropriate for a filter that starts as lit(true)
+    let default = true;
+
+    Ok(dynamic(
+        compute_operator,
+        rhs_closure,
+        rhs_dtype,
+        default,
+        lhs,
+    ))
 }
 
 /// Tries to convert the expressions into a vortex conjunction. Will return Ok(None) iff the input conjunction is empty.
 pub(crate) fn make_vortex_predicate(
     predicate: &[Arc<dyn PhysicalExpr>],
+    schema: &Schema,
 ) -> VortexResult<Option<Expression>> {
     let exprs = predicate
         .iter()
         .filter_map(|expr| {
-            // Handle dynamic expressions by snapshotting them first
-            let expr_to_convert = if is_dynamic_physical_expr(expr) {
-                // If snapshot fails, filter out this expression
-                let snapshot = snapshot_physical_expr(expr.clone()).ok()?;
+            // Check if this is a DynamicFilterPhysicalExpr
+            if expr.as_any().is::<DynamicFilterPhysicalExpr>() {
+                // For dynamic filters, pass the Arc and schema to preserve the shared state
+                // and correctly infer dtypes
+                return Some(convert_dynamic_filter(Arc::clone(expr), schema));
+            }
 
-                // Filter out literal true expressions (they don't add constraints)
-                if is_lit_true(&snapshot) {
-                    return None;
-                }
-
-                snapshot
-            } else {
-                expr.clone()
-            };
-
-            // Try to convert to Vortex expression
-            match Expression::try_from_df(expr_to_convert.as_ref()) {
+            // Try to convert to Vortex expression directly
+            match Expression::try_from_df(expr.as_ref()) {
                 Ok(vortex_expr) => Some(Ok(vortex_expr)),
                 Err(_) => {
                     // If we fail to convert the expression to Vortex, it's safe
@@ -87,11 +197,13 @@ pub(crate) fn make_vortex_predicate(
 //  for that node, up to any `and` or `or` node.
 impl TryFromDataFusion<dyn PhysicalExpr> for Expression {
     fn try_from_df(df: &dyn PhysicalExpr) -> VortexResult<Self> {
+        // Note: DynamicFilterPhysicalExpr is handled specially in make_vortex_predicate()
+        // because we need access to the Arc to properly share the dynamic state.
+
         if let Some(binary_expr) = df.as_any().downcast_ref::<df_expr::BinaryExpr>() {
             let left = Expression::try_from_df(binary_expr.left().as_ref())?;
-            let right = Expression::try_from_df(binary_expr.right().as_ref())?;
             let operator = Operator::try_from_df(binary_expr.op())?;
-
+            let right = Expression::try_from_df(binary_expr.right().as_ref())?;
             return Ok(Binary.new_expr(operator, [left, right]));
         }
 
@@ -381,22 +493,25 @@ mod tests {
 
     #[test]
     fn test_make_vortex_predicate_empty() {
-        let result = make_vortex_predicate(&[]).unwrap();
+        let schema = test_schema();
+        let result = make_vortex_predicate(&[], &schema).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_make_vortex_predicate_single() {
+        let schema = test_schema();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&[col_expr]).unwrap();
+        let result = make_vortex_predicate(&[col_expr], &schema).unwrap();
         assert!(result.is_some());
     }
 
     #[test]
     fn test_make_vortex_predicate_multiple() {
+        let schema = test_schema();
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
-        let result = make_vortex_predicate(&[col1, col2]).unwrap();
+        let result = make_vortex_predicate(&[col1, col2], &schema).unwrap();
         assert!(result.is_some());
         // Result should be an AND expression combining the two columns
     }
